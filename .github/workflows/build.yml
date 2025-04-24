@@ -1,0 +1,91 @@
+name: Flutter Auto Build and Release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Get latest frp version
+        id: frp_version
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const response = await github.rest.repos.getLatestRelease({
+              owner: 'fatedier',
+              repo: 'frp',
+            });
+            return response.data.tag_name;
+
+      - name: Version check
+        id: version_check
+        continue-on-error: true
+        run: |
+          CURRENT_TAG=$(curl -sH "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest" | jq -r .tag_name || echo "v0.0.0")
+          if [ "${{ steps.frp_version.outputs.result }}" != "$CURRENT_TAG" ]; then
+            echo "build_needed=true" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::No new version available"
+            echo "build_needed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Exit if no update
+        if: steps.version_check.outputs.build_needed != 'true'
+        run: exit 0
+
+      - name: Replace binaries
+        run: |
+          VERSION_TAG=${{ steps.frp_version.outputs.result }}
+          VERSION=$(echo "$VERSION_TAG" | sed 's/^v//')
+
+          # ARM64 (Android)
+          wget "https://github.com/fatedier/frp/releases/download/$VERSION_TAG/frp_${VERSION}_android_arm64.tar.gz"
+          tar -xzf frp_${VERSION}_android_arm64.tar.gz
+          mkdir -p android/app/src/main/jniLibs/arm64-v8a
+          mv frp_${VERSION}_android_arm64/frpc android/app/src/main/jniLibs/arm64-v8a/libfrpc.so
+
+          # x86_64 (Linux)
+          wget "https://github.com/fatedier/frp/releases/download/$VERSION_TAG/frp_${VERSION}_linux_amd64.tar.gz"
+          tar -xzf frp_${VERSION}_linux_amd64.tar.gz
+          mkdir -p android/app/src/main/jniLibs/x86_64
+          mv frp_${VERSION}_linux_amd64/frpc android/app/src/main/jniLibs/x86_64/libfrpc.so
+
+      - name: Build APKs
+        run: |
+          flutter pub get
+          flutter build apk --split-per-abi  # 生成arm64/x86_64单独APK
+          flutter build apk  # 生成通用APK
+
+      - name: Rename APKs
+        run: |
+          VERSION=$(echo ${{ steps.frp_version.outputs.result }} | sed 's/^v//')
+          BUILD_DIR="build/app/outputs/apk/release"
+          
+          # 重命名分架构APK
+          mv "$BUILD_DIR/app-arm64-v8a-release.apk" "frp-for-android-${VERSION}-arm64-v8a.apk"
+          mv "$BUILD_DIR/app-x86_64-release.apk" "frp-for-android-${VERSION}-x86_64.apk"
+          
+          # 重命名通用APK
+          mv "$BUILD_DIR/app-release.apk" "frp-for-android-${VERSION}-universal.apk"
+          
+          echo "APK_FILES=frp-for-android-${VERSION}-*.apk" >> $GITHUB_ENV
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.frp_version.outputs.result }}
+          name: "frp ${{ steps.frp_version.outputs.result }} Android Client"
+          files: ${{ env.APK_FILES }}
+          token: ${{ secrets.GITHUB_TOKEN }}
