@@ -1,9 +1,14 @@
-name: Flutter Auto Build and Release
+name: Auto Build and Release
 
 on:
   workflow_dispatch:
   schedule:
     - cron: '0 0 * * *'
+
+env:
+  KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+  KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+  KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
 
 jobs:
   build-and-release:
@@ -16,6 +21,23 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: '3.13.0'
+
+      - name: Setup Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '11'
+
+      - name: Decode signing key
+        run: |
+          echo "${{ secrets.KEYSTORE_FILE_BASE64 }}" | base64 --decode > android/app/key.jks
+          ls -la android/app/key.jks
+
+      - name: Fix Kotlin version
+        run: |
+          sed -i 's/org.jetbrains.kotlin.android version "[^"]*"/org.jetbrains.kotlin.android version "1.8.10"/' android/settings.gradle || true
+          sed -i 's/ext.kotlin_version = "[^"]*"/ext.kotlin_version = "1.8.10"/' android/build.gradle || true
 
       - name: Get latest frp version
         id: frp_version
@@ -65,19 +87,16 @@ jobs:
       - name: Build APKs
         run: |
           flutter pub get
-          flutter build apk --split-per-abi  # 生成arm64/x86_64单独APK
-          flutter build apk  # 生成通用APK
+          flutter build apk --split-per-abi --release --android-skip-build-dependency-validation
+          flutter build apk --release --android-skip-build-dependency-validation
 
       - name: Rename APKs
         run: |
           VERSION=$(echo ${{ steps.frp_version.outputs.result }} | sed 's/^v//')
           BUILD_DIR="build/app/outputs/apk/release"
           
-          # 重命名分架构APK
           mv "$BUILD_DIR/app-arm64-v8a-release.apk" "frp-for-android-${VERSION}-arm64-v8a.apk"
           mv "$BUILD_DIR/app-x86_64-release.apk" "frp-for-android-${VERSION}-x86_64.apk"
-          
-          # 重命名通用APK
           mv "$BUILD_DIR/app-release.apk" "frp-for-android-${VERSION}-universal.apk"
           
           echo "APK_FILES=frp-for-android-${VERSION}-*.apk" >> $GITHUB_ENV
@@ -87,5 +106,14 @@ jobs:
         with:
           tag_name: ${{ steps.frp_version.outputs.result }}
           name: "frp ${{ steps.frp_version.outputs.result }} Android Client"
+          body: "app：
+          - arm64-v8a
+          - x86_64
+          - universal
+          
+          signature: $(keytool -list -v -keystore android/app/key.jks -alias $KEY_ALIAS -storepass $KEYSTORE_PASSWORD -keypass $KEY_PASSWORD | grep SHA1)"
           files: ${{ env.APK_FILES }}
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup signing key
+        run: rm -f android/app/key.jks
