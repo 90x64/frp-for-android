@@ -7,7 +7,7 @@ on:
 
 env:
   FLUTTER_VERSION: '3.29.3'
-  KOTLIN_VERSION: '1.8.22'  # 明确指定Kotlin版本
+  KOTLIN_VERSION: '1.8.22'
   KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
   KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
   KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
@@ -31,23 +31,28 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
 
-      - name: Patch build files
+      - name: Fix Kotlin Configuration
         run: |
-          # 确保kotlin_version在build.gradle中定义
+          # 确保在android/build.gradle中正确定义kotlin_version
           if ! grep -q "ext.kotlin_version" android/build.gradle; then
-            echo -e "\next { kotlin_version = '${{ env.KOTLIN_VERSION }}' }" >> android/build.gradle
+            sed -i '/buildscript {/a ext.kotlin_version = '\''${{ env.KOTLIN_VERSION }}'\''' android/build.gradle
+          else
+            sed -i "s/ext.kotlin_version = .*/ext.kotlin_version = '${{ env.KOTLIN_VERSION }}'/" android/build.gradle
           fi
-          
-          # 更新Kotlin插件版本
-          sed -i "s/id 'org.jetbrains.kotlin.android' version '[^']*'/id 'org.jetbrains.kotlin.android' version '${{ env.KOTLIN_VERSION }}'/" android/build.gradle || true
-          sed -i "s/ext.kotlin_version = '[^']*'/ext.kotlin_version = '${{ env.KOTLIN_VERSION }}'/" android/build.gradle || true
+
+          # 确保插件版本一致
+          sed -i "s/id 'org.jetbrains.kotlin.android' version .*/id 'org.jetbrains.kotlin.android' version '${{ env.KOTLIN_VERSION }}' apply false/" android/build.gradle
+
+          # 打印验证
+          echo "=== Modified build.gradle ==="
+          cat android/build.gradle | grep -A 2 "ext.kotlin_version"
+          cat android/build.gradle | grep "org.jetbrains.kotlin.android"
 
       - name: Verify Environment
         run: |
           java -version
           flutter --version
           flutter doctor -v
-          cat android/build.gradle | grep kotlin_version
 
       - name: Decode signing key
         run: |
@@ -61,30 +66,34 @@ jobs:
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "Using version: ${VERSION}"
 
-      - name: Install dependencies
+      - name: Build Release APKs
         run: |
-          flutter pub get
-
-      - name: Build APKs
-        run: |
+          # 先清理构建缓存
+          flutter clean
+          
+          # 构建通用APK
           flutter build apk --release --no-tree-shake-icons
+          
+          # 构建分架构APK
           flutter build apk --split-per-abi --release --no-tree-shake-icons
 
-      - name: Rename APKs
+      - name: Prepare Artifacts
         run: |
           BUILD_DIR="build/app/outputs/apk"
+          mkdir -p artifacts
           
           # 通用APK
-          mv "$BUILD_DIR/release/app-release.apk" "frp-for-android-${{ steps.package_version.outputs.version }}-universal.apk"
+          cp "$BUILD_DIR/release/app-release.apk" "artifacts/frp-for-android-${{ steps.package_version.outputs.version }}-universal.apk"
           
           # 分架构APK
           for abi in arm64-v8a armeabi-v7a x86_64; do
             if [ -f "$BUILD_DIR/release/app-$abi-release.apk" ]; then
-              mv "$BUILD_DIR/release/app-$abi-release.apk" "frp-for-android-${{ steps.package_version.outputs.version }}-$abi.apk"
+              cp "$BUILD_DIR/release/app-$abi-release.apk" "artifacts/frp-for-android-${{ steps.package_version.outputs.version }}-$abi.apk"
             fi
           done
           
-          echo "APK_FILES=frp-for-android-${{ steps.package_version.outputs.version }}-*.apk" >> $GITHUB_ENV
+          echo "APK_FILES=artifacts/frp-for-android-${{ steps.package_version.outputs.version }}-*.apk" >> $GITHUB_ENV
+          ls -la artifacts/
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
