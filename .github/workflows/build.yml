@@ -1,4 +1,4 @@
-name: Auto Build and Release
+name: Flutter Build and Release
 
 on:
   workflow_dispatch:
@@ -6,6 +6,7 @@ on:
     - cron: '0 0 * * *'
 
 env:
+  FLUTTER_VERSION: '3.29.3'  # 明确指定Flutter版本
   KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
   KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
   KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
@@ -17,103 +18,77 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          flutter-version: '3.13.0'
-
       - name: Setup Java
         uses: actions/setup-java@v3
         with:
           distribution: 'zulu'
           java-version: '11'
 
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+
+      - name: Verify Versions
+        run: |
+          flutter --version
+          dart --version
+
       - name: Decode signing key
         run: |
           echo "${{ secrets.KEYSTORE_FILE_BASE64 }}" | base64 --decode > android/app/key.jks
-          ls -la android/app/key.jks
+          chmod 400 android/app/key.jks
 
-      - name: Fix Kotlin version
+      - name: Get package version
+        id: package_version
         run: |
-          sed -i 's/org.jetbrains.kotlin.android version "[^"]*"/org.jetbrains.kotlin.android version "1.8.10"/' android/settings.gradle || true
-          sed -i 's/ext.kotlin_version = "[^"]*"/ext.kotlin_version = "1.8.10"/' android/build.gradle || true
+          VERSION=$(grep 'version:' pubspec.yaml | awk '{print $2}' | cut -d'+' -f1)
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Using version: ${VERSION}"
 
-      - name: Get latest frp version
-        id: frp_version
-        uses: actions/github-script@v6
-        with:
-          script: |
-            const response = await github.rest.repos.getLatestRelease({
-              owner: 'fatedier',
-              repo: 'frp',
-            });
-            return response.data.tag_name;
-
-      - name: Version check
-        id: version_check
-        continue-on-error: true
+      - name: Install dependencies
         run: |
-          CURRENT_TAG=$(curl -sH "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/latest" | jq -r .tag_name || echo "v0.0.0")
-          if [ "${{ steps.frp_version.outputs.result }}" != "$CURRENT_TAG" ]; then
-            echo "build_needed=true" >> $GITHUB_OUTPUT
-          else
-            echo "::notice::No new version available"
-            echo "build_needed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Exit if no update
-        if: steps.version_check.outputs.build_needed != 'true'
-        run: exit 0
-
-      - name: Replace binaries
-        run: |
-          VERSION_TAG=${{ steps.frp_version.outputs.result }}
-          VERSION=$(echo "$VERSION_TAG" | sed 's/^v//')
-
-          # ARM64 (Android)
-          wget "https://github.com/fatedier/frp/releases/download/$VERSION_TAG/frp_${VERSION}_android_arm64.tar.gz"
-          tar -xzf frp_${VERSION}_android_arm64.tar.gz
-          mkdir -p android/app/src/main/jniLibs/arm64-v8a
-          mv frp_${VERSION}_android_arm64/frpc android/app/src/main/jniLibs/arm64-v8a/libfrpc.so
-
-          # x86_64 (Linux)
-          wget "https://github.com/fatedier/frp/releases/download/$VERSION_TAG/frp_${VERSION}_linux_amd64.tar.gz"
-          tar -xzf frp_${VERSION}_linux_amd64.tar.gz
-          mkdir -p android/app/src/main/jniLibs/x86_64
-          mv frp_${VERSION}_linux_amd64/frpc android/app/src/main/jniLibs/x86_64/libfrpc.so
+          flutter pub get
 
       - name: Build APKs
         run: |
-          flutter pub get
-          flutter build apk --split-per-abi --release --android-skip-build-dependency-validation
-          flutter build apk --release --android-skip-build-dependency-validation
+          flutter build apk --split-per-abi --release --target-platform android-arm64,android-x86_64
+          flutter build apk --release --target-platform android-arm64,android-x86_64
 
       - name: Rename APKs
         run: |
-          VERSION=$(echo ${{ steps.frp_version.outputs.result }} | sed 's/^v//')
-          BUILD_DIR="build/app/outputs/apk/release"
+          BUILD_DIR="build/app/outputs/apk"
           
-          mv "$BUILD_DIR/app-arm64-v8a-release.apk" "frp-for-android-${VERSION}-arm64-v8a.apk"
-          mv "$BUILD_DIR/app-x86_64-release.apk" "frp-for-android-${VERSION}-x86_64.apk"
-          mv "$BUILD_DIR/app-release.apk" "frp-for-android-${VERSION}-universal.apk"
+          # 重命名分架构APK
+          mv "$BUILD_DIR/release/app-arm64-v8a-release.apk" "frp-for-android-${{ steps.package_version.outputs.version }}-arm64-v8a.apk"
+          mv "$BUILD_DIR/release/app-x86_64-release.apk" "frp-for-android-${{ steps.package_version.outputs.version }}-x86_64.apk"
           
-          echo "APK_FILES=frp-for-android-${VERSION}-*.apk" >> $GITHUB_ENV
+          # 重命名通用APK
+          mv "$BUILD_DIR/release/app-release.apk" "frp-for-android-${{ steps.package_version.outputs.version }}-universal.apk"
+          
+          echo "APK_FILES=frp-for-android-${{ steps.package_version.outputs.version }}-*.apk" >> $GITHUB_ENV
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ steps.frp_version.outputs.result }}
-          name: "frp ${{ steps.frp_version.outputs.result }} Android Client"
-          body: "app：
-          - arm64-v8a
-          - x86_64
-          - universal
-          
-          signature: $(keytool -list -v -keystore android/app/key.jks -alias $KEY_ALIAS -storepass $KEYSTORE_PASSWORD -keypass $KEY_PASSWORD | grep SHA1)"
+          tag_name: "v${{ steps.package_version.outputs.version }}"
+          name: "frp-for-android v${{ steps.package_version.outputs.version }}"
+          body: |
+            ### app:
+            - arm64-v8a
+            - x86_64
+            - universal
+            
+            ### 构建信息:
+            - Flutter版本: ${{ env.FLUTTER_VERSION }}
+            - 构建时间: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
           files: ${{ env.APK_FILES }}
           token: ${{ secrets.GITHUB_TOKEN }}
+          draft: false
+          prerelease: false
 
-      - name: Cleanup signing key
-        run: rm -f android/app/key.jks
+      - name: Cleanup
+        run: |
+          rm -f android/app/key.jks
+          flutter clean
