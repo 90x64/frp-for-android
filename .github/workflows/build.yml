@@ -7,6 +7,7 @@ on:
 
 env:
   FLUTTER_VERSION: '3.29.3'
+  KOTLIN_VERSION: '1.8.22'  # 明确指定Kotlin版本
   KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
   KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
   KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
@@ -30,11 +31,23 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
 
+      - name: Patch build files
+        run: |
+          # 确保kotlin_version在build.gradle中定义
+          if ! grep -q "ext.kotlin_version" android/build.gradle; then
+            echo -e "\next { kotlin_version = '${{ env.KOTLIN_VERSION }}' }" >> android/build.gradle
+          fi
+          
+          # 更新Kotlin插件版本
+          sed -i "s/id 'org.jetbrains.kotlin.android' version '[^']*'/id 'org.jetbrains.kotlin.android' version '${{ env.KOTLIN_VERSION }}'/" android/build.gradle || true
+          sed -i "s/ext.kotlin_version = '[^']*'/ext.kotlin_version = '${{ env.KOTLIN_VERSION }}'/" android/build.gradle || true
+
       - name: Verify Environment
         run: |
           java -version
           flutter --version
           flutter doctor -v
+          cat android/build.gradle | grep kotlin_version
 
       - name: Decode signing key
         run: |
@@ -52,27 +65,24 @@ jobs:
         run: |
           flutter pub get
 
-      - name: Build APKs (Split per ABI)
-        run: |
-          flutter build apk --split-per-abi --release --no-tree-shake-icons
-
-      - name: Build Universal APK
+      - name: Build APKs
         run: |
           flutter build apk --release --no-tree-shake-icons
+          flutter build apk --split-per-abi --release --no-tree-shake-icons
 
       - name: Rename APKs
         run: |
           BUILD_DIR="build/app/outputs/apk"
           
-          # 重命名分架构APK
+          # 通用APK
+          mv "$BUILD_DIR/release/app-release.apk" "frp-for-android-${{ steps.package_version.outputs.version }}-universal.apk"
+          
+          # 分架构APK
           for abi in arm64-v8a armeabi-v7a x86_64; do
             if [ -f "$BUILD_DIR/release/app-$abi-release.apk" ]; then
               mv "$BUILD_DIR/release/app-$abi-release.apk" "frp-for-android-${{ steps.package_version.outputs.version }}-$abi.apk"
             fi
           done
-          
-          # 重命名通用APK
-          mv "$BUILD_DIR/release/app-release.apk" "frp-for-android-${{ steps.package_version.outputs.version }}-universal.apk"
           
           echo "APK_FILES=frp-for-android-${{ steps.package_version.outputs.version }}-*.apk" >> $GITHUB_ENV
 
@@ -86,10 +96,11 @@ jobs:
             - arm64-v8a (推荐主流设备)
             - armeabi-v7a (旧款ARM设备)
             - x86_64 (模拟器/Chromebook)
-            - universal (兼容所有设备)
+            - 通用APK (兼容所有设备)
             
             ### 构建信息:
             - Flutter版本: ${{ env.FLUTTER_VERSION }}
+            - Kotlin版本: ${{ env.KOTLIN_VERSION }}
             - Java版本: 17
             - 构建时间: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
           files: ${{ env.APK_FILES }}
